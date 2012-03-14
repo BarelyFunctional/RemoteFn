@@ -1,12 +1,25 @@
-(ns capture2
-  (:use [clojure.walk :only (macroexpand-all)])
+(ns capture
+  (:use form-analysis
+        [clojure.repl :only (source-fn)]
+        [clojure.walk :only (macroexpand-all postwalk-replace)])
   (:import java.io.InputStreamReader
            java.io.PushbackReader
            java.io.LineNumberReader))
 
-; fix-list
-(alter-var-root #'clojure.core/list (fn [list-fn] (fn [& args] (apply list-fn args))))
-(alter-meta! #'clojure.core/list dissoc :file :line)
+(defn add-meta [obj & kvs] (with-meta obj (apply assoc (meta obj) kvs)))
+
+(def ^:dynamic *capture* true)
+
+(defmacro cfn
+  "Capture the form and attach as meta-data
+   and attach the local bindings"
+  [& forms]
+  (if *capture*  
+	  (let [closures (vec (filter (free-vars (cons 'fn* forms)) (keys &env)))]
+      (if (empty? closures)
+        `(with-meta (fn* ~@forms) {:form '~&form})
+        `(with-meta (fn* ~@forms) {:form '~&form :closures (zipmap '~closures ~closures) })))
+   `(fn* ~forms)))
 
 (defn file-forms [filepath line-numbers]
   (when-let [strm (.getResourceAsStream (clojure.lang.RT/baseLoader) filepath)]
@@ -15,6 +28,26 @@
         (map (fn [ln]
                (dotimes [_ (- (dec ln) (.getLineNumber rdr))] (.readLine rdr))
                (read (PushbackReader. rdr))) line-numbers)))))
+
+(defn patch [v p]
+  (let [m (meta v)]
+    (binding [*ns* (:ns m)]
+      (alter-meta!
+        (eval (p (first (file-forms (:file m) [(:line m)]))))
+        (fn [new-meta] (if new-meta (conj new-meta m) m))))))
+
+(defn patch-letfn []
+  (patch #'clojure.core/letfn (partial postwalk-replace {'clojure.core/fn 'fn*})))
+  
+(defn patch-fn []
+  (patch #'clojure.core/fn (partial postwalk-replace {'fn* 'capture2/cfn})))
+
+(defn patch-list []
+  (alter-var-root 
+    #'clojure.core/list 
+    (with-meta (fn [list-fn] 
+                 (fn [& args] (apply list-fn args))) {:patched true}))
+  (alter-meta! #'clojure.core/list dissoc :file :line))
 
 (defn attach-sym [sym]
   (alter-var-root
@@ -25,11 +58,6 @@
 
 (defn fn-var? [v] (and (not (macro-var? v)) (fn? (var-get v))))
 
-; question does the macro introduce a new fn?
-; just redef the forms with more than 1 fn, that will work
-
-(defn all-vars [] (mapcat (comp vals ns-interns) (all-ns)))
-
 (defn forms [vars]
 	(reduce into {}
 		(map 
@@ -39,72 +67,54 @@
 		      (zipmap sorted-vars (file-forms f (map line sorted-vars)))))    
 		  (group-by (comp :file meta) (filter (comp (every-pred :file :line) meta) vars)))))
 
-(defn redefn []
-  (doall
-  (for [n (all-ns)]
-   (do
-    (println "Namespace:" n)
+(defn fn-emiting-form? [ns form]
+  ;(println form)
+  (binding [*ns* ns
+            *capture* false]
+    (->> form
+      macroexpand-all
+      flatten
+      (filter (partial = 'fn*))
+      rest
+      empty?
+      not)))
+
+(defn reval-ns! [n]
+  (println "revaluating functions in namespace:" n)
+  (let [v->o (->> n ns-interns vals (filter fn-var?) forms)
+        fp ;(every-pred 
+             (comp (partial = 'defn) first)
+             ;(partial fn-emiting-form? n))
+        v->f (->> v->o (filter
+                         (comp (partial = 'defn) first last)
+                       ;  (every-pred
+                       ;          (comp (partial = 'defn) first last)
+                       ;          (comp (partial fn-emiting-form? n) last))
+                       ))
+        reval (fn [[v f]] 
+                (let [m (meta v)]
+;                  (println v)
+                  (alter-meta! (eval f) conj m)))]                 
     (binding [*ns* n]
-      (doall
-      (for [[v f] (forms (filter fn-var? (vals (ns-interns n))))]
-        (do
-          (println v)
-;        (if-not (->> f macroexpand-all vector flatten (filter (partial = 'fn*)) (drop 1) empty?)
-          (eval f)))))))))
+	    (dorun (map reval v->f)))))
 
-; remember to restore the meta-data
-; define a function which creates and caches itself?
-(defn lazy-fn [v form]
-  (fn [& args]
-    (println "In function")
-    (let [f (eval form)]
-      (alter-var-root v (fn [_] f))
-      (apply f args))))
+(defn reval-all! [] (doall (map reval-ns! (all-ns))))
 
-; attach symbols to start with?
-; fix list so that it can take meta data?
+(defn attach-fn-meta []
+  (dorun
+	  (for [n (all-ns)
+	        [s v] (filter (comp fn-var? last) (ns-interns n))]
+       (try
+	       (alter-var-root v add-meta :ns n :name (symbol (name (ns-name n)) (name s)))
+        (catch Exception e)))))
 
-(defn reval [n v full-form]
-  (alter-var-root v
-    (fn [old-fn]    
-      (binding [*ns* n]
-        (-> full-form
-	        macroexpand
-	        last
-	        eval
-	        (with-meta (meta old-fn)))))))
-                
-(defn lazy-reval [n v full-form]
-  (alter-var-root v
-    (fn [old-fn]
-      (with-meta
-        (fn [& args]
-          (apply (reval n v full-form) (apply args)))
-        (meta old-fn)
-        ))))
+(defn fn-sym [f]
+  (or (:sym (meta f))
+      (and (= f list) 'clojure.core/list)))
 
-(defn attach-forms [vars]
-  (doall
-	  (map (fn [[v f]]
-	         (alter-var-root v (fn [o] (try
-                                      (vary-meta o assoc :form f)
-                                      (catch UnsupportedOperationException _ o)
-                                      (catch ClassCastException _ o)))))
-	    (forms vars))))
-
-(defn test1 [] 1)
-
-(defn test2 [] (test1))
-
-;(defn attach-syms [syms]
-;  (doall
-;    (map (alter-var-root (resolve %) (var-meta  
-  
-;(defn foobar []
-;  
-;  )
-
-(defmacro attach-def [form]
-  `(with-meta ~form {:form '~form}))
-
-; inside the capture macro bind all functions to their definition
+(defn capture []
+  (patch-list)
+  (patch-letfn)
+  (patch-fn)
+  (reval-all!)
+  (attach-fn-meta))

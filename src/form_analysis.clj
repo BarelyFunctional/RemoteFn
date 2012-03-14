@@ -8,7 +8,8 @@
   ^{:dynamic true}  
   free-vars class)
 
-(defn- coll-free-vars [coll] (mapunion free-vars coll))
+(defn- coll-free-vars [coll] 
+  (mapunion free-vars coll))
 
 (defmethod free-vars :default [_] #{})
 
